@@ -1,0 +1,20 @@
+email:
+  filters:
+    subject_keywords: ["test_api"]
+    sender_domains: ["gmail.com"]
+
+sharepoint:
+  client_id: ${PERSONAL_CLIENT_ID}
+  client_secret: ${PERSONAL_CLIENT_SECRET}
+  tenant_id: ${PERSONAL_TENANT_ID}
+  site_name: ${PERSONAL_SITE_NAME}
+  site_url: "https://mindinventory027.sharepoint.com/sites/${PERSONAL_SITE_NAME}"
+
+# -------------------- Heron API Configuration --------------------
+heron:
+  api_base_url: "https://app.herondata.io/api"
+  api_key: ${HERON_API_KEY}
+
+# -------------------- Storage Configuration --------------------
+storage:
+  base_download_dir: "downloads"

@@ -1,0 +1,5 @@
+__MACOSX
+__pycache__
+credentials.json
+token.pickle
+.env
