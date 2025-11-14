@@ -132,7 +132,7 @@ class HeronService:
             return None
 
     def check_file_status(self, heron_user_id: str):
-        """Gets the list of files and their processing status, with robust error handling."""
+        """Gets the list of files and their processing status"""
         try:
             url = f"{self.BASE_URL}/end_users/{heron_user_id}/files"
             response = requests.get(url, headers={"x-api-key": self.api_key}, timeout=10)
@@ -153,67 +153,92 @@ class HeronService:
 
     def wait_for_parsing(self, heron_user_id: str, max_retries: int = 30, delay: int = 10):
         """
-        Polls the file status until a file reaches 'transactions_loaded'.
-        FIXED VERSION: Handles None responses properly.
+        Polls file status until parsing completes successfully or fails.
         """
-        logger.info(f"Starting to poll status for {heron_user_id}...")
+        logger.info(f"Starting to poll parsing status for {heron_user_id}...")
+
+        SUCCESS_STATES = {"transactions_loaded", "parsed", "completed"}
+        PENDING_STATES = {"new", "processing", "parsing", "human_reviewing"}
+        FAILED_STATES = {"failed", "error", "rejected"}
 
         for attempt in range(max_retries):
             try:
-                # Get the status check data
                 file_data = self.check_file_status(heron_user_id)
 
-                # CRITICAL FIX: Check if file_data is None BEFORE trying to iterate
-                if file_data is None:
-                    logger.warning(
-                        f"Attempt {attempt + 1}/{max_retries}: API returned None or failed. Retrying in {delay}s...")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
-                        continue
-                    else:
-                        logger.error(f"Max retries ({max_retries}) reached. API consistently failed.")
-                        return False
+                if not file_data:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries}: No response or invalid format. Retrying...")
+                    time.sleep(delay)
+                    continue
 
-                # Check if file_data is a list before iterating
                 if not isinstance(file_data, list):
-                    logger.warning(
-                        f"Attempt {attempt + 1}/{max_retries}: Unexpected data type: {type(file_data)}. Expected list.")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries}: Unexpected data type {type(file_data)}. Retrying...")
+                    time.sleep(delay)
+                    continue
+
+                all_done = True  # assume done unless a pending one is found
+
+                for f in file_data:
+                    bank_statement = f.get("bank_statement")
+                    if not bank_statement or not isinstance(bank_statement, dict):
                         continue
-                    else:
-                        logger.error(f"Max retries ({max_retries}) reached. Data format issue.")
+
+                    status = bank_statement.get("status", "unknown")
+                    logger.info(f"Attempt {attempt + 1}/{max_retries}: File status = {status}")
+
+                    if status in SUCCESS_STATES:
+                        logger.info(f"✓ File successfully parsed ({status}) for {heron_user_id}")
+                        return True
+                    elif status in PENDING_STATES:
+                        all_done = False
+                    elif status in FAILED_STATES:
+                        logger.error(f"File parsing failed ({status}) for {heron_user_id}")
                         return False
 
-                # Now safe to iterate - check for success
-                for f in file_data:
-                    # Defensive chaining with .get()
-                    bank_statement = f.get('bank_statement')
-                    if bank_statement and isinstance(bank_statement, dict):
-                        status = bank_statement.get('status')
-                        if status == 'transactions_loaded':
-                            logger.info(f"✓ Parsing complete! Status: {status}")
-                            return True
-                        else:
-                            logger.info(f"Attempt {attempt + 1}/{max_retries}: Current status = {status}")
-
-                # If we reach here, parsing is still in progress
-                if attempt < max_retries - 1:
+                if not all_done:
                     logger.info(f"Attempt {attempt + 1}/{max_retries}: Parsing still in progress. Waiting {delay}s...")
                     time.sleep(delay)
-                else:
-                    logger.error(f"Max retries ({max_retries}) reached. Parsing timed out.")
-                    return False
+                    continue
+
+                logger.warning(f"Attempt {attempt + 1}/{max_retries}: No valid status found. Retrying...")
+                time.sleep(delay)
 
             except Exception as e:
-                logger.error(f"Exception in wait_for_parsing loop (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(delay)
-                else:
-                    logger.error(f"Max retries ({max_retries}) reached after exception.")
-                    return False
+                logger.error(f"Exception during status polling (Attempt {attempt + 1}): {e}")
+                time.sleep(delay)
 
+        logger.error(f"Parsing timed out after {max_retries * delay}s for {heron_user_id}.")
         return False
+
+    def upload_and_parse_with_retry(self, heron_user_id: str, file_path: str, max_retries: int = 30, delay: int = 10):
+        """
+        Full workflow: upload → parse → wait → auto re-upload if stuck
+
+        Returns:
+            tuple: (success: bool, file_id: str or None)
+        """
+        file_id = self.upload_pdf(heron_user_id, file_path)
+        if not file_id:
+            logger.error("Initial upload failed. Aborting.")
+            return False, None  # ← FIXED: Return tuple
+
+        self.parse_all_pdfs(heron_user_id)
+        success = self.wait_for_parsing(heron_user_id, max_retries=max_retries, delay=delay)
+
+        if not success:
+            # Check if all files are stuck at 'new'
+            file_data = self.check_file_status(heron_user_id)
+            if file_data and all(f.get("bank_statement", {}).get("status") == "new" for f in file_data):
+                logger.warning("All files stuck at 'new'. Re-uploading PDF to retry...")
+                new_file_id = self.upload_pdf(heron_user_id, file_path)
+                if new_file_id:
+                    file_id = new_file_id  # Update file_id with new upload
+                    self.parse_all_pdfs(heron_user_id)
+                    success = self.wait_for_parsing(heron_user_id, max_retries=max_retries, delay=delay)
+                else:
+                    logger.error("Re-upload failed. Manual check needed.")
+                    return False, None  # ← FIXED: Return tuple
+
+        return success, file_id  # ← FIXED: Return tuple (bool, str)
 
     def get_enriched_transactions(self, heron_user_id: str):
         """Retrieves all enriched transactions for a specific end user."""

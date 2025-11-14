@@ -11,7 +11,9 @@ logger = get_logger(name="bank_statement_detector.py")
 
 BANK_KEYWORDS = [
     "monthly statement", "account summary", "activity report", "statement period",
-    "deposits and withdrawals", "balance forward", "checking account", "savings account"
+    "deposits and withdrawals", "balance forward", "checking account", "savings account",
+    "Bank Statement", "Checking", "Checking Account", "Monthly Statement", "Account Summary",
+    "Beginning Balance", "Ending Balance", "Account History",
 ]
 COMMON_FILE_PATTERNS = re.compile(r'(bank|statement|account)_\d{4}-\d{2}-\d{2}\.pdf$', re.IGNORECASE)
 
@@ -187,27 +189,25 @@ class BankStatementDetector:
 
         # Define generalized patterns focusing on structure and common endings
         patterns = [
-            # *** NEW PRIORITY 1: Targeted for Bank Name (e.g., KeyBank) ***
-            # Searches for capitalized words ending in 'Bank' or 'Trust' followed by a line break.
-            # This will catch 'KeyBank' (source: 2) which appears on its own line early.
+            # NEW Priority 0: Mixed-case Bank Names (e.g., KeyBank, JP Morgan Bank)
+            r"([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*)*\s*(?:Bank|BANK|Trust|TRUST))",
+
+            # Priority 1: All-caps or uppercase block names ending in BANK or TRUST
             r"([A-Z\s,.-]+(BANK|TRUST))\s*\n",
 
-            # Original Priority 1: Customer Company Name (High Uniqueness)
-            # Captures multi-word, capitalized entities often followed by address or Account name
+            # Priority 2: Customer Company Name (e.g., ROBERT WEED PLYWOOD CORPORATION)
             r"([A-Z0-9\s,-]+ (LLC|INC|CORP|CO|GROUP|COLLECTIVE))\s*\n",
 
-            # Original Priority 2: Full Legal Bank Name near the start/address
-            # Targets names ending in common financial terms before address info or line breaks
+            # Priority 3: Full Legal Bank Name near address
             r"([A-Z\s,.-]+ (BANK|CREDIT UNION|TRUST|N\.A\.|FINANCIAL))\n",
 
-            # Original Priority 3: Customer Name Label (e.g., "Account name: John Smith")
+            # Priority 4: Account name label
             r"Account name:\s*(.+)\n",
 
-            # Original Priority 4: Generic Financial Institution name followed by an address line
-            # Tries to capture a name that appears immediately before a street address line
+            # Priority 5: Bank name followed by address line
             r"([A-Z\s,]+)\s*(BANK|TRUST)\n\s*(\d+\s*[A-Z][a-z]+ Street)",
 
-            # Original Priority 5: Short, capitalized word followed by 'Bank' (e.g., 'YOUR BANK' or 'ABC BANK')
+            # Priority 6: Short word + Bank (fallback)
             r"(\w+)\s*Bank"
         ]
 
@@ -246,7 +246,7 @@ class BankStatementDetector:
 
                 if len(bank_name) > 3 and "STATEMENT" not in bank_name.upper() and "BOX" not in bank_name.upper():
                     logger.info(f"Extracted Bank/Company ID: {bank_name}")
-                    return bank_name
+                    return "test_"+bank_name
 
         # If all regex fails, use a safe, unique fallback derived from the input text hash
         logger.warning("Failed to extract specific bank/company name. Using safe fallback.")

@@ -62,7 +62,7 @@ class SharePointMetadataService:
             heron_pdf_id: str = "",
             company_name: str = "",
             sharepoint_url: str = "",
-            end_user_id: str = ""
+            end_user_id:str=""
     ) -> bool:
         url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/listItem/fields"
 
@@ -80,12 +80,16 @@ class SharePointMetadataService:
             "CompanyName": company_name,
             "ParsedAt": datetime.now().isoformat(),
             "SharePointURL": sharepoint_url,
-            "EndUserId": end_user_id
+            "EndUserId":end_user_id
         }
+        if company_name:
+            metadata["CompanyName"] = company_name
+
         try:
             r = requests.patch(url, json=metadata, headers=headers)
+
             if r.status_code in (200, 201):
-                logger.info("SharePoint metadata updated successfully")
+                logger.info("sharePoint metadata updated successfully")
                 return True
             else:
                 logger.error(f"Metadata update failed: {r.status_code} → {r.text}")

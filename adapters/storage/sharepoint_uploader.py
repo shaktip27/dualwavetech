@@ -5,8 +5,8 @@ from adapters.utils.logger import get_logger
 
 logger = get_logger(name="sharepoint_adapter")
 
-class SharePointAdapter:
 
+class SharePointAdapter:
     """
         - Folder creation
         - File uploads (attachments + PDF copies)
@@ -107,6 +107,58 @@ class SharePointAdapter:
         except Exception as e:
             logger.error(f"Folder creation failed '{folder_path}': {e}")
             raise
+
+    def folder_exists(self, folder_path: str) -> bool:
+        """
+        Check if a folder exists in SharePoint by traversing the folder structure.
+        This method matches the logic used in _ensure_folder_exists().
+
+        Args:
+            folder_path: Folder path relative to root (e.g., "2025.11.14-company_name")
+
+        Returns:
+            bool: True if folder exists, False otherwise
+        """
+        try:
+            logger.info(f" Checking if folder exists: {folder_path}")
+
+            parent_id = "root"
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+
+            # Split the path and check each folder level
+            folders = folder_path.strip("/").split("/")
+
+            for i, folder_name in enumerate(folders):
+                url = f"{self.base_graph_url}/drives/{self.drive_id}/items/{parent_id}/children"
+
+                try:
+                    res = requests.get(url, headers=headers, timeout=10)
+                    res.raise_for_status()
+
+                    # Check if this folder exists at current level
+                    existing = [
+                        item for item in res.json().get("value", [])
+                        if item["name"] == folder_name and "folder" in item
+                    ]
+
+                    if existing:
+                        parent_id = existing[0]["id"]
+                        logger.info(f"   ✓ Found folder level {i + 1}/{len(folders)}: {folder_name}")
+                    else:
+                        logger.info(f"   ✗ Folder does NOT exist: {folder_path} (missing at: {folder_name})")
+                        return False
+
+                except requests.RequestException as e:
+                    logger.error(f"Error checking folder level '{folder_name}': {e}")
+                    return False
+
+            # If we made it through all levels, folder exists
+            logger.info(f"Folder EXISTS: {folder_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Unexpected error checking folder {folder_path}: {e}", exc_info=True)
+            return False
 
     def upload_file(self, file_path, folder_path=None):
         """

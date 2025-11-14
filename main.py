@@ -10,11 +10,8 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from adapters.utils.heron_service import HeronService
 import time
-import os
 from adapters.utils.config import config
 from dotenv import load_dotenv
-
-load_dotenv()
 
 # -------------------- Setup Logger --------------------
 setup_logger("app.log")
@@ -25,24 +22,27 @@ logger = get_logger("main")
 filters = config["email"]["filters"]
 heron = HeronService(api_key=config["heron"]["api_key"])
 
+sharepoint_config = config["sharepoint"]
+
+logger.info(f"{sharepoint_config['client_id']},,,{sharepoint_config['client_secret']},,{sharepoint_config['tenant_id']}")
 # -------------------- Initialize Dependencies --------------------
 logger.info("Initializing dependencies...")
 
 authenticator = OutlookAuthenticator(
-    client_id=os.getenv("CLIENT_ID"),
-    client_secret=os.getenv("CLIENT_SECRET"),
-    tenant_id=os.getenv("TENANT_ID")
+    client_id=sharepoint_config["client_id"],
+    client_secret=sharepoint_config["client_secret"],
+    tenant_id=sharepoint_config["tenant_id"],
 )
 detector = BankStatementDetector()
 
 # SharePoint Adapter
-sharepoint_config = config["sharepoint"]
 uploader = SharePointAdapter(
     client_id=sharepoint_config["client_id"],
     client_secret=sharepoint_config["client_secret"],
     tenant_id=sharepoint_config["tenant_id"],
     site_name=sharepoint_config["site_name"],
 )
+
 
 lists = requests.get(
     f"https://graph.microsoft.com/v1.0/sites/{uploader.site_id}/lists",
