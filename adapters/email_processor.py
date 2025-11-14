@@ -430,7 +430,8 @@ class EmailProcessor:
                     processing_status=parse_status,  # Use the final determined status
                     heron_pdf_id=pdf_id or "",
                     company_name=company_name,
-                    sharepoint_url=sharepoint_url
+                    sharepoint_url=sharepoint_url,
+                        
                 )
                 if sp_update:
                     logger.info(f"SharePoint metadata updated for {file_name} → {parse_status}")

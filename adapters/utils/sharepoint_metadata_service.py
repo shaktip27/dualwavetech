@@ -30,7 +30,8 @@ class SharePointMetadataService:
             {"name": "HeronID", "text": {}},
             {"name": "CompanyName", "text": {}},
             {"name": "ParsedAt", "dateTime": {}},
-            {"name": "SharePointURL", "text": {}}
+            {"name": "SharePointURL", "text": {}},
+            {"name": "EndUserId", "text": {}}
         ]
 
         logger.info("Initializing SharePoint columns...")
@@ -60,7 +61,8 @@ class SharePointMetadataService:
             processing_status: str,
             heron_pdf_id: str = "",
             company_name: str = "",
-            sharepoint_url: str = ""
+            sharepoint_url: str = "",
+            end_user_id: str = ""
     ) -> bool:
         url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/listItem/fields"
 
@@ -77,7 +79,8 @@ class SharePointMetadataService:
             "HeronID": heron_pdf_id,
             "CompanyName": company_name,
             "ParsedAt": datetime.now().isoformat(),
-            "SharePointURL": sharepoint_url
+            "SharePointURL": sharepoint_url,
+            "EndUserId": end_user_id
         }
         try:
             r = requests.patch(url, json=metadata, headers=headers)

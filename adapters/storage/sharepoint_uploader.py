@@ -5,8 +5,8 @@ from adapters.utils.logger import get_logger
 
 logger = get_logger(name="sharepoint_adapter")
 
-
 class SharePointAdapter:
+
     """
         - Folder creation
         - File uploads (attachments + PDF copies)
@@ -47,14 +47,19 @@ class SharePointAdapter:
     def _get_site_id(self):
         """Retrieve SharePoint site ID"""
         try:
-            hostname = "mindinventory027.sharepoint.com"  # Replace with your actual tenant
+            hostname = "atiumcapital.sharepoint.com"
             url = f"{self.base_graph_url}/sites/{hostname}:/sites/{self.site_name}"
             headers = {"Authorization": f"Bearer {self.access_token}"}
+
             res = requests.get(url, headers=headers)
             res.raise_for_status()
-            return res.json()["id"]
+
+            site_id = res.json()["id"]
+            logger.info(f"Site ID fetched: {site_id}")
+            return site_id
+
         except Exception as e:
-            logger.critical(f"Failed to get Site ID: {e}")
+            logger.critical(f"❌ Failed to get Site ID: {e}")
             raise
 
     def get_drive_id(self):
