@@ -4,17 +4,23 @@ from datetime import datetime
 from adapters.utils.logger import get_logger
 import hashlib
 import json
-import re
 import traceback
 from adapters.utils.heron_service import HeronService
 from adapters.utils.sharepoint_metadata_service import SharePointMetadataService
 from adapters.utils.pdf_generator import generate_email_pdf
 from adapters.utils.zip_handler import ZipHandler
 
+# Import LLM extractor
+from adapters.utils.llm_company_extractor import PDFAnalyzerGenAI
+
 logger = get_logger("email_processor")
 
 # -------------------- Ledger --------------------
+
 LEDGER_FILE = os.path.join(os.getcwd(), "attachment_log.json")
+
+# Company name extraction retry configuration
+MAX_COMPANY_EXTRACTION_RETRIES = 2
 
 
 def ensure_ledger():
@@ -82,7 +88,6 @@ def log_attachment(message_id, file_name, file_hash, outcome, error=None):
 
 
 class EmailProcessor:
-    """Handles the full lifecycle of an incoming email with new SharePoint folder structure."""
 
     def __init__(self, storage_adapter, detector, base_download_dir: str,
                  sp_metadata_service: SharePointMetadataService, heron_service: HeronService):
@@ -93,15 +98,19 @@ class EmailProcessor:
         self.sp_metadata_service = sp_metadata_service
         self.heron_service = heron_service
         self.zip_handler = ZipHandler()
+        self._extracted_company_name = None  # Cache for company name within a batch
+        self._timestamped_folder = None  # Cache for folder structure
+        self._email_pdf_uploaded = False  # Flag to track if email PDF was uploaded
+        self.pdf_analyzer = PDFAnalyzerGenAI()  # Initialize once
 
     def _cleanup_local_file(self, file_path: str, description: str):
         """Safely remove a local file if it exists."""
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
-                logger.info(f"Cleaned up {description}: {file_path}")
+                logger.debug(f"Successfully removed {description} file: {file_path}")
             except OSError as e:
-                logger.error(f" Error deleting {description} {file_path}: {e}")
+                logger.error(f"Error deleting {description} file {file_path}: {e}")
 
     def _cleanup_directory(self, dir_path: str, description: str):
         """Safely remove a directory and all its contents."""
@@ -109,43 +118,9 @@ class EmailProcessor:
             try:
                 import shutil
                 shutil.rmtree(dir_path)
-                logger.info(f"Cleaned up {description} directory: {dir_path}")
+                logger.debug(f"Successfully removed {description} directory: {dir_path}")
             except Exception as e:
                 logger.error(f"Error deleting {description} directory {dir_path}: {e}")
-
-    def _get_unique_folder_name(self, base_folder_name: str) -> str:
-        """
-        Check if SharePoint folder exists and return unique folder name.
-        If folder exists, append (1), (2), etc.
-        """
-        try:
-            if not self._storage_adapter.folder_exists(base_folder_name):
-                logger.info(f"Folder '{base_folder_name}' does not exist. Using as is.")
-                return base_folder_name
-
-            logger.info(f"Folder '{base_folder_name}' already EXISTS! Finding next available number...")
-            counter = 1
-            while True:
-                new_folder_name = f"{base_folder_name}({counter})"
-                logger.info(f"   Checking: {new_folder_name}")
-
-                if not self._storage_adapter.folder_exists(new_folder_name):
-                    logger.info(f"Found unique folder name: {new_folder_name}")
-                    return new_folder_name
-
-                logger.info(f" {new_folder_name} also exists, trying next...")
-                counter += 1
-
-                if counter > 100:
-                    logger.error(f"Too many duplicate folders for {base_folder_name}. Using timestamp fallback.")
-                    timestamp = datetime.utcnow().strftime('%H%M%S')
-                    fallback = f"{base_folder_name}_{timestamp}"
-                    logger.info(f"Using fallback: {fallback}")
-                    return fallback
-
-        except Exception as e:
-            logger.error(f"Error checking folder uniqueness: {e}. Using original name.", exc_info=True)
-            return base_folder_name
 
     def _upload_with_retry(self, local_path: str, folder_name: str, file_name: str):
         """Upload a file to SharePoint with exponential backoff retry logic."""
@@ -153,7 +128,7 @@ class EmailProcessor:
             logger.info(f"Uploading {file_name} to SharePoint (Attempt {attempt}/{self._max_retries})...")
             try:
                 result = self._storage_adapter.upload_file(local_path, folder_path=folder_name)
-                logger.info(f"Upload successful for {file_name} → {result.get('webUrl')}")
+                logger.info(f"Upload successful for {file_name} to {result.get('webUrl')}")
                 return result
             except Exception as e:
                 logger.warning(f"Upload FAILED for {file_name} on attempt {attempt}: {e}")
@@ -164,29 +139,87 @@ class EmailProcessor:
                     return None
         return None
 
-    def _upload_email_pdf(self, email_data: dict, base_folder: str, company_name: str):
+    def _extract_company_name_with_retry(self, file_path: str) -> str:
         """
-        Generate a PDF from email data and upload it to SharePoint in summary_mail folder.
+        Extract company name with retry logic (max 2 attempts).
+        Returns company name or None if extraction fails (NO DEFAULT VALUE).
         """
-        pdf_path = None
-        new_pdf_path = None
+        logger.info(f"Extracting company name from file: {os.path.basename(file_path)}")
+
+        for attempt in range(1, MAX_COMPANY_EXTRACTION_RETRIES + 1):
+            try:
+                logger.info(f"Company name extraction attempt {attempt}/{MAX_COMPANY_EXTRACTION_RETRIES}")
+
+                gemini_response = self.pdf_analyzer.analyze_pdf(file_path=file_path)
+
+                if gemini_response and len(gemini_response) > 0:
+                    company_name = gemini_response[0].get("owner")
+
+                    if company_name and company_name.strip() and company_name.upper() not in ["UNKNOWN_COMPANY",
+                                                                                              "UNKNOWN", ""]:
+                        logger.info(f"Successfully extracted company name: {company_name}")
+                        return company_name.strip()
+                    else:
+                        logger.warning(f"Invalid company name extracted on attempt {attempt}: {company_name}")
+                else:
+                    logger.warning(f"Empty response from PDF analyzer on attempt {attempt}")
+
+            except Exception as e:
+                logger.error(f"Error extracting company name on attempt {attempt}: {e}")
+                logger.debug(traceback.format_exc())
+
+            if attempt < MAX_COMPANY_EXTRACTION_RETRIES:
+                logger.info(f"Retrying company name extraction after 2 seconds...")
+                time.sleep(2)
+
+        logger.error(
+            f"Failed to extract company name after {MAX_COMPANY_EXTRACTION_RETRIES} attempts. ABORTING PROCESS.")
+        return None  # Return None to indicate failure - NO DEFAULT VALUE
+
+    def _create_timestamped_folder(self, company_name: str) -> str:
+        """
+        Create timestamped folder structure at root: YYYY.MM.DD_company_name
+        If folder exists, append (1), (2), etc.
+        Uses folder_exists() to properly check for existing folders.
+        """
+        timestamp = datetime.utcnow().strftime('%Y.%m.%d')
+        base_folder = f"{timestamp}_{company_name}"
+
+        counter = 0
+        folder_name = base_folder
+
+        # Check if folder exists using the folder_exists method
+        while self._storage_adapter.folder_exists(folder_name):
+            counter += 1
+            folder_name = f"{base_folder}({counter})"
+            if counter > 100:  # Safety limit
+                logger.error(f"Reached maximum folder counter limit (100) for {base_folder}")
+                break
+
+        logger.info(f"Using folder name: {folder_name}")
+        return folder_name
+
+    def _upload_email_pdf(self, email_data: dict, company_folder: str):
+        """
+        Generate a PDF from email data and upload it to summary_mail folder.
+        Only uploads once per email processing cycle.
+        """
+        if self._email_pdf_uploaded:
+            logger.info("Email PDF already uploaded for this email. Skipping duplicate upload.")
+            return
 
         try:
             os.makedirs(self._base_download_dir, exist_ok=True)
 
-            # Generate PDF
             pdf_path = generate_email_pdf(email_data, self._base_download_dir)
 
-            # Create timestamp for filename
             timestamp = datetime.utcnow().strftime('%Y.%m.%d-%H.%M.%S')
-            new_pdf_name = f"{timestamp}-{company_name}.pdf"
+            new_pdf_name = f"{timestamp}-email_summary.pdf"
 
-            # Rename the PDF file locally
             new_pdf_path = os.path.join(self._base_download_dir, new_pdf_name)
             os.rename(pdf_path, new_pdf_path)
 
-            # Upload to summary_mail folder
-            summary_mail_folder = f"{base_folder}/summary_mail"
+            summary_mail_folder = f"{company_folder}/summary_mail"
 
             upload_result = self._upload_with_retry(
                 new_pdf_path,
@@ -195,217 +228,278 @@ class EmailProcessor:
             )
 
             if upload_result:
-                logger.info(f"Email PDF uploaded successfully to {summary_mail_folder}: {upload_result.get('webUrl')}")
+                logger.info(f"Email PDF uploaded successfully to {summary_mail_folder}")
+                self._email_pdf_uploaded = True  # Mark as uploaded
             else:
                 logger.warning(f"Failed to upload email PDF for subject: {email_data.get('subject')}")
 
+            if os.path.exists(new_pdf_path):
+                os.remove(new_pdf_path)
+
         except Exception as e:
             logger.error(f"Failed to generate/upload email PDF: {e}")
-        finally:
-            # CLEANUP: Always remove local PDF files
-            if new_pdf_path and os.path.exists(new_pdf_path):
-                self._cleanup_local_file(new_pdf_path, "email PDF")
-            elif pdf_path and os.path.exists(pdf_path):
-                self._cleanup_local_file(pdf_path, "email PDF")
 
-    def process_attachment(self, adapter_temp_path: str, base_folder: str, email_data: dict) -> None:
+    def process_attachment(self, adapter_temp_path: str, email_data: dict) -> None:
         """
-        Processes a single attachment with new folder structure.
-        All files go into base_folder/Dataroom/
+        Process attachment locally, then upload to final destination.
         """
         file_name = os.path.basename(adapter_temp_path)
-        logger.info(f"Starting processing for attachment: {file_name}")
+        logger.info(f"Starting processing for file: {file_name}")
 
-        try:
-            # Check if the attachment is a ZIP file
-            if self.zip_handler.is_zip_file(adapter_temp_path):
-                logger.info(f"Detected ZIP file: {file_name}. Extracting contents...")
-                self._process_zip_attachment(adapter_temp_path, base_folder, email_data)
-            else:
-                # Process as regular file - goes into Dataroom
-                dataroom_folder = f"{base_folder}/Dataroom"
-                self._process_single_file(adapter_temp_path, dataroom_folder, email_data)
-        finally:
-            # CLEANUP: Always remove the original adapter temp file
-            self._cleanup_local_file(adapter_temp_path, "adapter temporary attachment")
+        if self.zip_handler.is_zip_file(adapter_temp_path):
+            logger.info(f"Detected ZIP file: {file_name}. Extracting contents...")
+            self._process_zip_attachment(adapter_temp_path, email_data)
+        else:
+            self._process_single_file(adapter_temp_path, email_data)
 
-    def _process_zip_attachment(self, zip_path: str, base_folder: str, email_data: dict):
-        """
-        Extract ZIP file and process each file inside.
-        All extracted files go into base_folder/Dataroom/
-        """
+    def _process_zip_attachment(self, zip_path: str, email_data: dict):
+        """Extract ZIP and process each file"""
         zip_file_name = os.path.basename(zip_path)
         extract_dir = os.path.join(self._base_download_dir, f"extracted_{int(time.time())}")
 
         try:
-            # Extract ZIP contents
             extracted_files = self.zip_handler.extract_zip(zip_path, extract_dir)
 
             if not extracted_files:
                 logger.warning(f"No files extracted from ZIP: {zip_file_name}")
-                log_attachment(
-                    email_data.get('id', 'unknown'),
-                    zip_file_name,
-                    compute_sha256(zip_path),
-                    outcome="EmptyZIP"
-                )
                 return
 
-            # Filter to supported file types
             supported_files = self.zip_handler.get_supported_files(extracted_files)
 
             if not supported_files:
                 logger.warning(f"No supported files found in ZIP: {zip_file_name}")
-                log_attachment(
-                    email_data.get('id', 'unknown'),
-                    zip_file_name,
-                    compute_sha256(zip_path),
-                    outcome="NoSupportedFiles"
-                )
                 return
 
             logger.info(f"Processing {len(supported_files)} files from ZIP: {zip_file_name}")
 
-            # All extracted files go into Dataroom
-            dataroom_folder = f"{base_folder}/Dataroom"
+            # Separate bank statements and non-bank files
+            bank_statements = []
+            non_bank_files = []
 
-            # Process each extracted file
             for extracted_file in supported_files:
                 try:
-                    logger.info(f"Processing extracted file: {os.path.basename(extracted_file)}")
-                    self._process_single_file(extracted_file, dataroom_folder, email_data, is_from_zip=True)
-                except Exception as e:
-                    logger.error(f"Error processing file from ZIP {extracted_file}: {e}")
+                    with open(extracted_file, "rb") as f:
+                        file_content = f.read()
 
-            # Log the ZIP file itself
+                    file_name = os.path.basename(extracted_file)
+                    is_bank, _ = self._detector.detect(file_content, file_name)
+
+                    if is_bank:
+                        bank_statements.append(extracted_file)
+                        logger.info(f"File {file_name} identified as BANK STATEMENT")
+                    else:
+                        non_bank_files.append(extracted_file)
+                        logger.info(f"File {file_name} identified as NON-BANK file")
+
+                except Exception as e:
+                    logger.error(f"Error checking file type for {extracted_file}: {e}")
+
+            # Process non-bank files first
+            if non_bank_files:
+                logger.info(f"Processing {len(non_bank_files)} non-bank files from ZIP...")
+                for non_bank_file in non_bank_files:
+                    try:
+                        logger.info(f"Processing non-bank file: {os.path.basename(non_bank_file)}")
+                        self._process_single_file(non_bank_file, email_data, is_from_zip=True)
+                    except Exception as e:
+                        logger.error(f"Error processing non-bank file {non_bank_file}: {e}")
+
+            # Process bank statements
+            if bank_statements:
+                logger.info(f"Processing {len(bank_statements)} bank statements from ZIP...")
+                for bank_statement in bank_statements:
+                    try:
+                        logger.info(f"Processing bank statement: {os.path.basename(bank_statement)}")
+                        self._process_single_file(bank_statement, email_data, is_from_zip=True)
+                    except Exception as e:
+                        logger.error(f"Error processing bank statement {bank_statement}: {e}")
+
             log_attachment(
                 email_data.get('id', 'unknown'),
                 zip_file_name,
                 compute_sha256(zip_path),
-                outcome="ZIPProcessed",
-                error=f"Extracted {len(supported_files)} files"
+                outcome="ZIPProcessed"
             )
 
         except Exception as e:
             logger.error(f"Error processing ZIP file {zip_file_name}: {e}")
-            log_attachment(
-                email_data.get('id', 'unknown'),
-                zip_file_name,
-                'N/A',
-                outcome="ZIPError",
-                error=str(e)
-            )
         finally:
-            # CLEANUP: Always remove extracted directory and ZIP file
             self._cleanup_directory(extract_dir, "ZIP extraction")
             self._cleanup_local_file(zip_path, "ZIP file")
 
-    def _process_single_file(self, file_path: str, folder_name: str, email_data: dict, is_from_zip: bool = False):
+    def _process_single_file(self, file_path: str, email_data: dict, is_from_zip: bool = False):
         """
-        Process a single file (PDF, DOC, CSV, etc.) and upload to specified folder.
-        CLEANUP happens in finally block regardless of success/failure.
+        NEW FLOW IMPLEMENTATION with company name caching and retry logic.
         """
         original_file_name = os.path.basename(file_path)
         unique_file_name = get_unique_filename(original_file_name)
+
         local_path = os.path.join(self._base_download_dir, unique_file_name)
 
-        upload_result = None
-        file_hash = None
-        parse_status = "NotProcessed"
-        heron_user_id = None
-        pdf_id = None
-        company_name = ""
-        sharepoint_url = ""
-        file_content = None
-
-        heron_service_client = self.heron_service
-
         logger.info(f"Processing file: {original_file_name}{' (from ZIP)' if is_from_zip else ''}")
-        if unique_file_name != original_file_name:
-            logger.info(f"Renamed to avoid duplicate: {unique_file_name}")
+
+        file_hash = None
 
         try:
-            # Save locally (if not already in base_download_dir)
+            # Step 1: Save file locally if needed
             if file_path != local_path:
                 if os.path.exists(file_path):
                     with open(file_path, "rb") as src:
                         file_content = src.read()
                     with open(local_path, "wb") as dst:
                         dst.write(file_content)
-                    logger.info(f"Saved file locally → {local_path}")
                 else:
                     logger.warning(f"File not found: {file_path}")
-                    log_attachment(email_data.get('id', 'unknown'), unique_file_name, 'N/A', outcome="file_missing")
                     return
             else:
                 with open(file_path, "rb") as f:
                     file_content = f.read()
 
-            # Compute hash
             file_hash = compute_sha256(local_path)
 
-            # Upload to SharePoint using unique filename
-            upload_result = self._upload_with_retry(local_path, folder_name, unique_file_name)
-            if upload_result:
-                parse_status = "Success"
-                sharepoint_url = upload_result.get("webUrl", "")
-                logger.info(f"File uploaded to: {folder_name}/{unique_file_name}")
-            else:
-                parse_status = "UploadFailed"
-                logger.error(f"Failed to upload {unique_file_name} to SharePoint")
-                return
-
-            # Detect bank statement
-            is_bank, company_name = self._detector.detect(file_content, unique_file_name)
+            # Step 2: Check if file is a BANK STATEMENT
+            logger.info(f"Checking if file is a bank statement: {unique_file_name}")
+            is_bank, _ = self._detector.detect(file_content, unique_file_name)
 
             if not is_bank:
-                parse_status = "NotBankStatement"
-                logger.info(f"File {unique_file_name} is not a bank statement.")
-            else:
-                try:
-                    # Heron: Upload & Parse
-                    heron_user_id = heron_service_client.ensure_user(company_name)
-                    logger.info(f"Heron End User ID: {heron_user_id}")
+                logger.info(f"File {unique_file_name} is NOT a bank statement. Moving to non_bank folder...")
 
-                    success, pdf_id = heron_service_client.upload_and_parse_with_retry(
-                        heron_user_id=heron_user_id,
-                        file_path=local_path,
-                        max_retries=3,
+                # Create timestamped non_bank folder
+                timestamp = datetime.utcnow().strftime('%Y.%m.%d')
+                non_bank_folder = f"{timestamp}_non_bank"
+
+                upload_result = self._upload_with_retry(local_path, non_bank_folder, unique_file_name)
+
+                if upload_result:
+                    logger.info(f"File moved to non_bank folder: {upload_result.get('webUrl')}")
+                    log_attachment(
+                        email_data.get('id', 'unknown'),
+                        unique_file_name,
+                        file_hash,
+                        outcome="NotBankStatement_MovedToNonBank"
+                    )
+                else:
+                    logger.error(f"Failed to move file to non_bank folder")
+                    log_attachment(
+                        email_data.get('id', 'unknown'),
+                        unique_file_name,
+                        file_hash,
+                        outcome="NotBankStatement_UploadFailed"
                     )
 
-                    if success:
-                        parsed_data = heron_service_client.get_enriched_transactions(heron_user_id)
-                        parse_status = "Parsed"
-                        num_tx = len(parsed_data.get('transactions_enriched', [])) if parsed_data else 0
-                        logger.info(f"Heron retrieval successful. Transactions retrieved: {num_tx} Tx")
-                    else:
-                        parse_status = "HeronError"
-                        logger.error(f"Heron processing failed after retries for {unique_file_name}")
+                logger.info(f"Processing stopped for non-bank statement: {unique_file_name}")
+                return
 
-                except Exception as e:
-                    logger.error(f"Heron Processing Error for {unique_file_name}: {e}")
+            # Step 3: IS A BANK STATEMENT - Extract company name with caching
+            logger.info(f"File IS a bank statement: {unique_file_name}")
+
+            # Use cached company name if available, otherwise extract it
+            if self._extracted_company_name:
+                company_name = self._extracted_company_name
+                logger.info(f"Using cached company name: {company_name}")
+            else:
+                company_name = self._extract_company_name_with_retry(local_path)
+
+                if not company_name:
+                    logger.error(
+                        f"Failed to extract company name after {MAX_COMPANY_EXTRACTION_RETRIES} attempts. ABORTING PROCESS for {unique_file_name}")
+                    log_attachment(
+                        email_data.get('id', 'unknown'),
+                        unique_file_name,
+                        file_hash,
+                        outcome="CompanyExtractionFailed_ProcessAborted",
+                        error="Failed to extract company name after retries - process aborted"
+                    )
+                    return
+
+                # Cache the extracted company name for subsequent files
+                self._extracted_company_name = company_name
+
+            logger.info(f"Company Name: {company_name}")
+
+            # Step 4: Create or use cached timestamped folder structure
+            if self._timestamped_folder:
+                timestamped_folder = self._timestamped_folder
+                logger.info(f"Using cached folder structure: {timestamped_folder}")
+            else:
+                timestamped_folder = self._create_timestamped_folder(company_name)
+                self._timestamped_folder = timestamped_folder  # Cache for subsequent files
+                logger.info(f"Created new folder structure: {timestamped_folder}")
+
+            company_folder = f"{timestamped_folder}/Dataroom"
+
+            # Step 5: Upload to company/Dataroom folder
+            logger.info(f"Uploading file to {company_folder}...")
+
+            final_upload_result = self._upload_with_retry(
+                local_path,
+                company_folder,
+                unique_file_name
+            )
+
+            if not final_upload_result:
+                logger.error(f"Failed to upload file to {company_folder}")
+                log_attachment(email_data.get('id', 'unknown'), unique_file_name, file_hash,
+                               outcome="UploadFailed")
+                return
+
+            logger.info(f"File uploaded successfully to: {final_upload_result.get('webUrl')}")
+
+            # Step 6: Call HERON API for parsing
+            logger.info(f"Calling Heron API for parsing...")
+
+            heron_user_id = None
+            pdf_id = None
+            parse_status = "Pending"
+
+            try:
+                heron_user_id = self.heron_service.ensure_user(company_name)
+                logger.info(f"Heron End User ID: {heron_user_id}")
+
+                success, pdf_id = self.heron_service.upload_and_parse_with_retry(
+                    heron_user_id=heron_user_id,
+                    file_path=local_path,
+                    max_retries=3,
+                )
+
+                if success:
+                    parsed_data = self.heron_service.get_enriched_transactions(heron_user_id)
+                    num_tx = len(parsed_data.get('transactions_enriched', [])) if parsed_data else 0
+                    logger.info(f"Heron parsing successful. Transactions: {num_tx}")
+                    parse_status = "Parsed"
+                else:
+                    logger.error(f"Heron processing failed after retries")
                     parse_status = "HeronError"
 
-            # Update SharePoint metadata
-            if upload_result:
+            except Exception as e:
+                logger.error(f"Heron Processing Error: {e}")
+                parse_status = "HeronError"
+
+            # Step 7: Update SharePoint metadata
+            if final_upload_result:
                 sp_update = self.sp_metadata_service.update_sharepoint_metadata_graph(
-                    drive_id=upload_result["drive_id"],
-                    item_id=upload_result["id"],
+                    drive_id=final_upload_result["drive_id"],
+                    item_id=final_upload_result["id"],
                     attachment_hash=file_hash,
                     source_email_id=email_data.get("id", ""),
                     source_sender=email_data.get("sender", ""),
                     processing_status=parse_status,
                     heron_pdf_id=pdf_id or "",
                     company_name=company_name,
-                    sharepoint_url=sharepoint_url,
-                    end_user_id=heron_user_id
+                    sharepoint_url=final_upload_result.get('webUrl', ''),
+                    end_user_id=heron_user_id or ""
                 )
-                if sp_update:
-                    logger.info(f"SharePoint metadata updated for {unique_file_name} → {parse_status}")
-                else:
-                    logger.error(f"SharePoint metadata update failed for {unique_file_name}")
 
-            # Log attachment outcome with unique filename
+                if sp_update:
+                    logger.info(f"SharePoint metadata updated: {parse_status}")
+                else:
+                    logger.error(f"SharePoint metadata update failed")
+
+            # Step 8: Upload email PDF to summary_mail folder (ONLY ONCE)
+            if not self._email_pdf_uploaded:
+                logger.info(f"Uploading email PDF to summary_mail folder...")
+                self._upload_email_pdf(email_data, timestamped_folder)
+
             log_attachment(
                 email_data.get('id', 'unknown'),
                 unique_file_name,
@@ -413,36 +507,28 @@ class EmailProcessor:
                 outcome=parse_status
             )
 
+            logger.info(f"Processing completed successfully for {unique_file_name}")
+
         except Exception as e:
-            parse_status = "Error"
-            logger.critical(f"Unexpected error during processing of {unique_file_name}:\n{traceback.format_exc()}")
-            log_attachment(email_data.get('id', 'unknown'), unique_file_name, file_hash or 'N/A',
-                           outcome=parse_status, error=str(e))
+            logger.critical(f"Unexpected error processing {unique_file_name}: {str(e)}")
+            logger.debug(traceback.format_exc())
+
+            log_attachment(
+                email_data.get('id', 'unknown'),
+                unique_file_name,
+                file_hash or 'N/A',
+                outcome="Error",
+                error=str(e)
+            )
 
         finally:
-            # CLEANUP: Always remove local files regardless of success/failure
-            logger.info(f"Starting cleanup for {unique_file_name}...")
+            self._cleanup_local_file(local_path, "attachment")
 
-            # Remove the processed file from base_download_dir
-            if os.path.exists(local_path):
-                self._cleanup_local_file(local_path, "processed file")
-
-            # If file was copied from different location, remove original too
-            if not is_from_zip and file_path != local_path:
-                if os.path.exists(file_path):
-                    self._cleanup_local_file(file_path, "original file")
-
-            logger.info(f"Cleanup completed for {unique_file_name}")
+            if file_path != local_path:
+                self._cleanup_local_file(file_path, "adapter temporary")
 
     def process_email(self, email_data: dict):
-        """
-        Processes all attachments within a single email with new folder structure.
 
-        Structure created:
-        YYYY.MM.DD-company_name/
-          ├── Dataroom/
-          └── summary_mail/
-        """
         sender = email_data['sender']
         subject = email_data['subject']
         attachments = email_data.get('attachments', [])
@@ -451,26 +537,18 @@ class EmailProcessor:
             logger.info("No attachments found, skipping email.")
             return
 
-        # Extract company name from sender
-        company_name = sender.split('@')[0] if '@' in sender else sender
+        logger.info(f"Processing email from {sender}: {subject}")
+        logger.info(f"Found {len(attachments)} attachment(s)")
 
-        # Create base folder name with date
-        date_str = datetime.utcnow().strftime('%Y.%m.%d')
-        base_folder_initial = f"{date_str} {company_name}"
+        # Reset all caches for each new email
+        self._extracted_company_name = None
+        self._timestamped_folder = None
+        self._email_pdf_uploaded = False
 
-        # Get unique folder name (adds (1), (2) if folder already exists in SharePoint)
-        base_folder = self._get_unique_folder_name(base_folder_initial)
-
-        logger.info(f"Processing email from {sender}, base folder → {base_folder}")
-        if base_folder != base_folder_initial:
-            logger.info(f"Folder renamed to avoid duplicate: {base_folder}")
-        logger.info(f"Folder structure: {base_folder}/Dataroom/ and {base_folder}/summary_mail/")
-
-        # Process all attachments - they will go into Dataroom
         for attachment_path in attachments:
-            self.process_attachment(attachment_path, base_folder, email_data)
+            try:
+                self.process_attachment(attachment_path, email_data)
+            except Exception as e:
+                logger.error(f"Error processing attachment {attachment_path}: {e}")
 
-        # Upload email PDF to summary_mail folder
-        self._upload_email_pdf(email_data, base_folder, company_name)
-
-        logger.info(f"Email processing completed for {base_folder}")
+        logger.info(f"Email processing completed for: {subject}")

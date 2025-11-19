@@ -7,6 +7,16 @@ import pdfplumber
 import docx
 from adapters.utils.logger import get_logger
 
+# Import for OCR on image-based PDFs
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    print("⚠️ Warning: pdf2image or pytesseract not installed. Image-based PDF OCR will be skipped.")
+
 logger = get_logger(name="bank_statement_detector.py")
 
 BANK_KEYWORDS = [
@@ -19,15 +29,66 @@ COMMON_FILE_PATTERNS = re.compile(r'(bank|statement|account)_\d{4}-\d{2}-\d{2}\.
 
 
 class BankStatementDetector:
-    
+
     def __init__(self, required_keywords: List[str] = BANK_KEYWORDS, min_keyword_threshold: int = 3):
         self._required_keywords = [kw.lower() for kw in required_keywords]
         self._min_keyword_threshold = min_keyword_threshold
-        logger.info("BankStatementDetector module initialized with custom keywords.")
+
+        if OCR_AVAILABLE:
+            logger.info("✅ BankStatementDetector initialized with OCR support (Pytesseract)")
+        else:
+            logger.warning("⚠️ BankStatementDetector initialized WITHOUT OCR support")
+
+    def _extract_text_with_ocr(self, file_content: bytes) -> Optional[str]:
+        """
+        Extract text from image-based PDFs using OCR (Pytesseract).
+
+        Args:
+            file_content (bytes): PDF file content
+
+        Returns:
+            Optional[str]: Extracted text or None if OCR fails
+        """
+        if not OCR_AVAILABLE:
+            logger.warning("⚠️ OCR libraries not available. Skipping OCR extraction.")
+            return None
+
+        try:
+            logger.info("🔍 Attempting OCR extraction (image-based PDF detected)...")
+
+            # Convert PDF to images
+            images = convert_from_bytes(file_content, first_page=1, last_page=3)
+
+            extracted_text = ""
+
+            # Run OCR on each page
+            for i, image in enumerate(images, 1):
+                logger.info(f"📄 Running OCR on page {i}/{len(images)}...")
+
+                # Extract text using Pytesseract
+                page_text = pytesseract.image_to_string(image)
+                extracted_text += page_text + "\n"
+
+            if extracted_text.strip():
+                logger.info(f"✅ OCR extraction successful! Extracted {len(extracted_text)} characters")
+                return extracted_text.lower()
+            else:
+                logger.warning("⚠️ OCR completed but no text extracted")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ OCR extraction failed: {e}")
+            return None
 
     def _extract_pdf(self, file_content: bytes) -> Optional[str]:
+        """
+        Extract text from PDF. If normal extraction fails or returns minimal text,
+        try OCR for image-based PDFs.
+        """
         try:
             text = ""
+            has_text = False
+
             with pdfplumber.open(io.BytesIO(file_content)) as pdf:
                 for i, page in enumerate(pdf.pages):
                     if i >= 5:  # only first 5 pages
@@ -35,12 +96,29 @@ class BankStatementDetector:
                     page_text = page.extract_text()
                     if page_text:
                         text += page_text
+                        has_text = True
 
+            # Check if we got meaningful text
+            if has_text and len(text.strip()) > 100:
+                logger.info(f"✅ Extracted {len(text)} characters using pdfplumber")
+                return text.lower()
+
+            # If text extraction failed or returned minimal text, try OCR
+            logger.info("⚠️ Minimal or no text extracted with pdfplumber. Trying OCR...")
+            ocr_text = self._extract_text_with_ocr(file_content)
+
+            if ocr_text:
+                return ocr_text
+
+            # If OCR also failed, return what we have (might be empty)
             return text.lower() if text else None
 
         except Exception as e:
-            logger.error(f"PDF extraction failed. File likely corrupt, encrypted, or malformed. Details: {e}")
-            return None
+            logger.error(f"❌ PDF extraction failed. File likely corrupt, encrypted, or malformed. Details: {e}")
+
+            # Try OCR as last resort
+            logger.info(" Attempting OCR as fallback...")
+            return self._extract_text_with_ocr(file_content)
 
     def _extract_docx(self, file_content: bytes) -> Optional[str]:
 
@@ -102,11 +180,14 @@ class BankStatementDetector:
 
         name_lower = file_name.lower()
 
-        if not name_lower.endswith(('.pdf', '.doc', '.docx', '.csv')): return False
+        if not name_lower.endswith(('.pdf', '.doc', '.docx', '.csv')):
+            return False
 
-        if any(k in name_lower for k in ["statement", "bank", "account_summary"]): return True
+        if any(k in name_lower for k in ["statement", "bank", "account_summary"]):
+            return True
 
-        if re.search(r'(bank|statement|account)', name_lower, re.IGNORECASE): return True
+        if re.search(r'(bank|statement|account)', name_lower, re.IGNORECASE):
+            return True
 
         return False
 
@@ -125,12 +206,12 @@ class BankStatementDetector:
 
         is_match = found_count >= self._min_keyword_threshold
         if is_match:
-            logger.info(f"Content matched {found_count} keywords (Threshold: {self._min_keyword_threshold}).")
+            logger.info(f"✅ Content matched {found_count} keywords (Threshold: {self._min_keyword_threshold}).")
 
         return is_match, text_content
 
     def detect(self, file_content: bytes, file_name: str):
-        logger.info(f"Starting detection for file: {file_name}")
+        logger.info(f"🔍 Starting detection for file: {file_name}")
 
         is_match_content, text_content = self._check_content_keywords(file_content, file_name)
         is_match_filename = self._check_filename(file_name)
@@ -140,7 +221,7 @@ class BankStatementDetector:
 
         # Strategy 1: Strong Content Match
         if is_match_content:
-            logger.info(f"PASS: Confirmed by strong content keywords for {file_name}.")
+            logger.info(f"✅ PASS: Confirmed by strong content keywords for {file_name}.")
             return True, bank_name
 
         # Strategy 2: Filename Fallback
@@ -149,35 +230,8 @@ class BankStatementDetector:
                 f"PASS (FILENAME FALLBACK): Confirmed by strong filename '{file_name}' despite poor content match.")
             return True, bank_name
 
-        logger.info(f"FAIL: File {file_name} does not meet bank statement criteria.")
+        logger.info(f" FAIL: File {file_name} does not meet bank statement criteria.")
         return False, bank_name
-
-
-    # def extract_company_name(self, text: str) -> str:
-    #     """
-    #     Extract possible Company/Account holder name from bank statement text
-    #     """
-    #
-    #     if not text:
-    #         return "UNKNOWN_COMPANY"
-    #
-    #     patterns = [
-    #         r"Account Name\s*[:\-]?\s*(.+)",
-    #         r"A/C Name\s*[:\-]?\s*(.+)",
-    #         r"Company Name\s*[:\-]?\s*(.+)",
-    #         r"Customer Name\s*[:\-]?\s*(.+)",
-    #         r"Client Name\s*[:\-]?\s*(.+)",
-    #         r"Account Holder\s*[:\-]?\s*(.+)"
-    #     ]
-    #
-    #     for pattern in patterns:
-    #         match = re.search(pattern, text, re.IGNORECASE)
-    #         if match:
-    #             company = match.group(1).strip().split("\n")[0]
-    #             logger.info(f"Extracted Company Name: {company}")
-    #             return company
-    #
-    #     return "UNKNOWN_COMPANY"
 
     def extract_company_name(self, text: str) -> str:
         """
@@ -245,8 +299,8 @@ class BankStatementDetector:
                 bank_name = bank_name.split('\n')[0].strip()
 
                 if len(bank_name) > 3 and "STATEMENT" not in bank_name.upper() and "BOX" not in bank_name.upper():
-                    logger.info(f"Extracted Bank/Company ID: {bank_name}")
-                    return "test_"+bank_name
+                    logger.info(f"📋 Extracted Bank/Company ID: {bank_name}")
+                    return bank_name
 
         # If all regex fails, use a safe, unique fallback derived from the input text hash
         logger.warning("Failed to extract specific bank/company name. Using safe fallback.")
