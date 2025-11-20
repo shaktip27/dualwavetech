@@ -92,18 +92,17 @@ class ZipHandler:
     def get_supported_files(file_paths: list) -> list:
         """
         Filter files to only include supported document types.
-
-        Args:
-            file_paths (list): List of file paths to filter
-
-        Returns:
-            list: Filtered list containing only supported file types
+        UPDATED: Now includes image files and all document types
         """
-        supported_extensions = ['.pdf', '.doc', '.docx', '.csv', '.xls', '.xlsx']
+        # *** UPDATED: Added more image extensions and document types ***
+        supported_extensions = [
+            '.pdf', '.doc', '.docx', '.csv', '.xls', '.xlsx',  # Documents
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp'  # Images
+        ]
         supported_files = []
 
         for file_path in file_paths:
-            # Additional check: skip if basename starts with ._ (in case it slipped through)
+            # Additional check: skip if basename starts with ._ (MacOS metadata)
             basename = os.path.basename(file_path)
             if basename.startswith('._'):
                 logger.warning(f"Skipping MacOS metadata file: {basename}")
@@ -112,8 +111,8 @@ class ZipHandler:
             _, ext = os.path.splitext(file_path)
             if ext.lower() in supported_extensions:
                 supported_files.append(file_path)
-                logger.info(f"Supported file: {basename}")
+                logger.info(f"✅ Supported file: {basename}")
             else:
-                logger.warning(f"Unsupported file type skipped: {basename} ({ext})")
+                logger.warning(f"⚠️ Unsupported file type skipped: {basename} ({ext})")
 
         return supported_files
