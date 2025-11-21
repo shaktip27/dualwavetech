@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from datetime import datetime
 from adapters.utils.logger import get_logger
@@ -83,6 +84,22 @@ def log_attachment(message_id, file_name, file_hash, outcome, error=None):
     with open(LEDGER_FILE, "w") as f:
         json.dump(ledger, f, indent=4)
 
+def clean_string(text: str) -> str:
+    text = text.replace(".", "")
+    return text.rstrip("-.")
+
+def clean_company_string(text: str) -> str:
+    # Replace special characters with _
+    text = re.sub(r'[\\/*?:"<>|.-]', "_", text)
+
+    # Replace multiple underscores with a single one
+    text = re.sub(r'_+', "_", text)
+
+    # Strip leading/trailing underscores
+    text = text.strip("_")
+
+    return text
+
 
 class EmailProcessor:
     """
@@ -150,8 +167,8 @@ class EmailProcessor:
 
                 gemini_response = self.pdf_analyzer.analyze_pdf(file_path=file_path)
 
-                if gemini_response and len(gemini_response) > 0:
-                    company_name = gemini_response[0].get("owner")
+                if gemini_response:
+                    company_name = gemini_response.get("owner")
 
                     if company_name and company_name.strip() and company_name.upper() not in ["UNKNOWN_COMPANY",
                                                                                               "UNKNOWN", ""]:
@@ -365,6 +382,7 @@ class EmailProcessor:
                 if self._extracted_company_name:
                     company_name = self._extracted_company_name
                     logger.info(f"Using cached company: {company_name}")
+                    company_name = clean_company_string(company_name)
                 else:
                     company_name = self._extract_company_name_with_retry(local_path)
                     if not company_name:
@@ -372,6 +390,7 @@ class EmailProcessor:
                         log_attachment(email_data.get('id'), unique_file_name, file_hash,
                                        outcome="CompanyExtractionFailed")
                         return
+                    company_name = clean_company_string(company_name)
                     self._extracted_company_name = company_name
 
                 # Create folder
@@ -381,6 +400,7 @@ class EmailProcessor:
                     timestamped_folder = self._create_timestamped_folder(company_name)
                     self._timestamped_folder = timestamped_folder
 
+                timestamped_folder = clean_string(timestamped_folder)
                 company_folder = f"{timestamped_folder}/Dataroom"
 
                 # Upload

@@ -104,7 +104,7 @@ except Exception as e:
 sp_metadata_service = SharePointMetadataService(
     site_id=uploader.site_id,
     list_id=list_id,
-    access_token=uploader.access_token
+    sharepoint_adapter=uploader
 )
 logger.info("Metadata service initialized.")
 

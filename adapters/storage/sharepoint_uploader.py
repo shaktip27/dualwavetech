@@ -7,6 +7,7 @@ logger = get_logger(name="sharepoint_adapter")
 
 
 class SharePointAdapter:
+
     """
     SharePoint adapter with automatic token refresh capability.
     Features:
